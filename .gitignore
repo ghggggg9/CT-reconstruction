@@ -1,0 +1,56 @@
+# ========================================
+# CT Reconstruction Project - Git Ignore
+# ========================================
+
+# Large checkpoint and output directories
+checkpoints_transformer/
+outputs_transformer/
+
+# Original dataset directories (too large)
+LIDC-IDRI/
+DRR_Final/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Log files
+*.log
+nohup.out
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Model temporary files
+*.ckpt.tmp
+*.pth.tmp
+
+# System files
+Thumbs.db
+.directory
