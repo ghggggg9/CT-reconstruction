@@ -10,7 +10,6 @@ outputs_transforme_10.6/
 
 # Original dataset directories (too large)
 LIDC-IDRI/
-DRR_Final/
 
 # Python cache
 __pycache__/
