@@ -16,6 +16,7 @@ from PIL import Image
 import os
 import sys
 import pydicom
+import cv2
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from skimage import exposure
@@ -96,7 +97,7 @@ class CTDataset(Dataset):
     
     def __len__(self):
         return len(self.patients)
-    
+
     # 替换train.py中的CTDataset.__getitem__方法
 
     def __getitem__(self, idx):
@@ -190,11 +191,12 @@ class CTDataset(Dataset):
                     # 改为软组织窗口，更适合全身CT
                     img = np.clip(img, -400, 400)  # 软组织窗口
                     img = (img + 400) / 800  # 归一化到[0,1]
-                    
-                    # Resize
-                    img_pil = Image.fromarray((img * 255).astype(np.uint8))
-                    img_pil = img_pil.resize((self.target_size, self.target_size), Image.LANCZOS)
-                    img_array = np.array(img_pil, dtype=np.float32) / 127.5 - 1
+
+                    # Resize - 使用cv2保持float32精度，避免uint8量化损失
+                    img_resized = cv2.resize(img, (self.target_size, self.target_size),
+                                            interpolation=cv2.INTER_LANCZOS4)
+                    # 直接归一化到[-1,1]，保持高精度
+                    img_array = img_resized * 2.0 - 1.0  # [0,1] -> [-1,1]
                     slices.append(img_array)
                 except Exception as e:
                     continue
@@ -204,7 +206,7 @@ class CTDataset(Dataset):
             
             # Stack slices - 确保是3D数组 [D, H, W]
             ct = np.stack(slices)
-            
+
             # CT data augmentation
             if self.augmentation and random.random() > 0.5:
                 ct = np.flip(ct, axis=2)
@@ -341,7 +343,19 @@ class ImprovedTransformerTrainer:
         # Learning rate scheduling
         self.warmup_steps = config['warmup_steps']
         self.current_step = 0
-        
+
+        # LR Scheduler (NEW - Cosine Annealing)
+        if config.get('use_scheduler', False):
+            self.scheduler_G = optim.lr_scheduler.CosineAnnealingLR(
+                self.opt_G, T_max=config['epochs'], eta_min=1e-6
+            )
+            self.scheduler_D = optim.lr_scheduler.CosineAnnealingLR(
+                self.opt_D, T_max=config['epochs'], eta_min=1e-6
+            )
+        else:
+            self.scheduler_G = None
+            self.scheduler_D = None
+
         # Mixed precision
         self.scaler = GradScaler() if config['use_amp'] else None
         
@@ -536,7 +550,54 @@ class ImprovedTransformerTrainer:
             'lr_g': self.opt_G.param_groups[0]['lr'],
             'lr_d': self.opt_D.param_groups[0]['lr']
         }
-    
+
+    @torch.no_grad()
+    def validate(self, val_loader):
+        """Validation function (NEW)"""
+        self.G.eval()
+        self.D.eval()
+
+        val_psnrs = []
+        val_ssims = []
+
+        print("  Running validation...")
+        for xray, ct_real, _, _ in val_loader:
+            xray = xray.to(self.device)
+            ct_real = ct_real.to(self.device)
+            depth = ct_real.shape[2]
+
+            # Generate
+            ct_fake = self.G(xray, depth)
+
+            # Calculate metrics on CPU
+            ct_fake_np = ct_fake.cpu().numpy()
+            ct_real_np = ct_real.cpu().numpy()
+
+            for i in range(ct_fake_np.shape[0]):
+                fake_vol = (ct_fake_np[i, 0] + 1) / 2  # [-1,1] -> [0,1]
+                real_vol = (ct_real_np[i, 0] + 1) / 2
+
+                # PSNR and SSIM on middle slice
+                mid_slice = fake_vol.shape[0] // 2
+                fake_slice = fake_vol[mid_slice]
+                real_slice = real_vol[mid_slice]
+
+                try:
+                    p = psnr(real_slice, fake_slice, data_range=1.0)
+                    s = ssim(real_slice, fake_slice, data_range=1.0)
+                    val_psnrs.append(p)
+                    val_ssims.append(s)
+                except:
+                    pass
+
+        self.G.train()
+        self.D.train()
+
+        avg_psnr = np.mean(val_psnrs) if val_psnrs else 0
+        avg_ssim = np.mean(val_ssims) if val_ssims else 0
+
+        return avg_psnr, avg_ssim
+
     def save_checkpoint(self, epoch, path):
         """Save checkpoint"""
         checkpoint = {
@@ -586,8 +647,24 @@ def load_checkpoint(trainer, checkpoint_path, device):
             # 尝试加载判别器权重 - 如果失败，完全重新初始化
             discriminator_loaded = False
             try:
-                # First, try to load the discriminator state
-                trainer.D.load_state_dict(checkpoint['D'])
+                # 预先创建first_layer以匹配checkpoint结构
+                # 通过执行一次dummy forward pass触发first_layer的创建
+                print("  → 预创建判别器first_layer...")
+                try:
+                    with torch.no_grad():
+                        # 创建与真实数据相同形状的dummy输入
+                        # X-ray: [B, 2, H, W], CT: [B, 1, D, H, W]
+                        dummy_xray = torch.randn(1, 2, 256, 256).to(device)
+                        dummy_ct = torch.randn(1, 1, 48, 256, 256).to(device)
+                        # 执行forward触发first_layer创建
+                        _ = trainer.D(dummy_xray, dummy_ct)
+                    print("  ✓ first_layer已创建，准备加载权重")
+                except Exception as e:
+                    print(f"  ⚠ 预创建first_layer失败: {e}")
+                    print("  → 将尝试直接加载")
+
+                # Now try to load the discriminator state with strict=True
+                trainer.D.load_state_dict(checkpoint['D'], strict=True)
                 print("  ✓ 成功加载判别器权重")
                 discriminator_loaded = True
             except RuntimeError as e:
@@ -776,8 +853,8 @@ def visualize_results(xray, ct_real, ct_fake, save_path, epoch, batch_idx, metri
             title = f'Gen Axial z={slice_idx}'
             color = 'blue'
         
-        # 增强对比度
-        slice_data = exposure.equalize_adapthist(slice_data, clip_limit=0.03)
+        # 使用原始数据，不做CLAHE增强（避免引入噪声和误导性纹理）
+        # 注释掉CLAHE: slice_data = exposure.equalize_adapthist(slice_data, clip_limit=0.03)
         ax.imshow(slice_data, cmap='gray', vmin=0, vmax=1)
         ax.set_title(title, fontsize=9, color=color)
         ax.axis('off')
@@ -799,12 +876,12 @@ def visualize_results(xray, ct_real, ct_fake, save_path, epoch, batch_idx, metri
             title = f'Gen Coronal y={slice_idx}'
             color = 'blue'
         
-        # 增强对比度
-        slice_data = exposure.equalize_adapthist(slice_data, clip_limit=0.03)
+        # 使用原始数据，不做CLAHE增强
+        # 注释掉CLAHE: slice_data = exposure.equalize_adapthist(slice_data, clip_limit=0.03)
         ax.imshow(slice_data, cmap='gray', aspect='auto', vmin=0, vmax=1)
         ax.set_title(title, fontsize=9, color=color)
         ax.axis('off')
-    
+
     # ========== 第四行：Sagittal切片（矢状面） ==========
     for i in range(6):
         ax = plt.subplot(4, 6, 19 + i)
@@ -822,8 +899,8 @@ def visualize_results(xray, ct_real, ct_fake, save_path, epoch, batch_idx, metri
             title = f'Gen Sagittal x={slice_idx}'
             color = 'blue'
         
-        # 增强对比度
-        slice_data = exposure.equalize_adapthist(slice_data, clip_limit=0.03)
+        # 使用原始数据，不做CLAHE增强
+        # 注释掉CLAHE: slice_data = exposure.equalize_adapthist(slice_data, clip_limit=0.03)
         ax.imshow(slice_data, cmap='gray', aspect='auto', vmin=0, vmax=1)
         ax.set_title(title, fontsize=9, color=color)
         ax.axis('off')
@@ -908,19 +985,24 @@ def main():
         'weight_l1': 50.0,       # Very high L1 weight!
         'weight_proj': 1.0,       # Projection consistency
         
-        # Key: Learning rate settings
-        'lr_g': 0.00002,          # Higher generator learning rate
-        'lr_d': 0.00001,        # Very low discriminator learning rate!
-        'weight_decay': 0.001,
-        
+        # Key: Learning rate settings (improved for stability)
+        'lr_g': 0.0001,           # Reduced for stability
+        'lr_d': 0.0001,           # Reduced for stability
+        'weight_decay': 0.0001,
+        'use_scheduler': True,    # Enable cosine annealing
+
         # Key: Training strategy
-        'd_update_freq': 3,      # Update discriminator every 10 steps only!
-        
+        'd_update_freq': 3,       # Update discriminator every 3 steps
+
         # Training parameters
         'batch_size': 1,
-        'epochs': 5000,
+        'epochs': 10000,
         'warmup_steps': 500,
-        'grad_clip': 0.1,
+        'grad_clip': 1.0,         # Gradient clipping for stability
+
+        # Validation settings (NEW)
+        'val_split': 0.1,         # 10% validation set
+        'val_interval': 10,       # Validate every N epochs
         
         # System settings
         'use_amp': False,         # Mixed precision
@@ -933,14 +1015,31 @@ def main():
         'save_freq': 500,
         
         # Resume training
-        'resume': True,  # Set to True to automatically resume from latest checkpoint
+        'resume': False,  # Set to True to automatically resume from latest checkpoint
         'checkpoint_name': 'latest.pth',  # Which checkpoint to load
     }
     
     # Create directories
     os.makedirs(config['output_dir'], exist_ok=True)
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
-    
+
+    # Setup logging to file (NEW - simple approach)
+    log_file = os.path.join(config['checkpoint_dir'], 'training.log')
+    class Logger:
+        def __init__(self, filename):
+            self.terminal = sys.stdout
+            self.log = open(filename, 'a')
+        def write(self, message):
+            self.terminal.write(message)
+            self.log.write(message)
+            self.log.flush()
+        def flush(self):
+            self.terminal.flush()
+            self.log.flush()
+
+    sys.stdout = Logger(log_file)
+    sys.stderr = sys.stdout
+
     # Print configuration
     print("\n" + "="*70)
     print("TRANSFORMER GAN TRAINING WITH CHECKPOINT RESUME")
@@ -959,8 +1058,12 @@ def main():
     print(f"Model: {config['base_channels']}ch base, {config['max_depth']} depth")
     print(f"Loss weights - GAN: {config['weight_gan']}, L1: {config['weight_l1']}, Proj: {config['weight_proj']}")
     print(f"Learning rates - G: {config['lr_g']}, D: {config['lr_d']}")
+    print(f"Gradient clipping: {config['grad_clip']}")
+    print(f"LR Scheduler: {'Enabled' if config['use_scheduler'] else 'Disabled'}")
+    print(f"Validation split: {config['val_split']*100:.0f}% (every {config['val_interval']} epochs)")
     print(f"Discriminator update frequency: every {config['d_update_freq']} steps")
     print(f"Resume training: {config['resume']}")
+    print(f"Log file: {log_file}")
     print("="*70)
     
     # ========== Dataset ==========
@@ -974,11 +1077,11 @@ def main():
         training=True
     )
     
-    # Split dataset
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
+    # Split dataset (using config)
+    val_size = int(config['val_split'] * len(dataset))
+    train_size = len(dataset) - val_size
     train_set, val_set = random_split(dataset, [train_size, val_size])
-    
+
     train_loader = DataLoader(
         train_set,
         batch_size=config['batch_size'],
@@ -987,7 +1090,16 @@ def main():
         pin_memory=config['pin_memory'],
         collate_fn=collate_fn
     )
-    
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=config['pin_memory'],
+        collate_fn=collate_fn
+    )
+
     print(f"✓ Dataset loaded: {len(train_set)} train, {len(val_set)} val")
     
     # ========== Trainer ==========
@@ -1112,7 +1224,29 @@ def main():
         if (epoch + 1) % 10 == 0:
             epoch_path = os.path.join(config['checkpoint_dir'], f'epoch_{epoch+1}.pth')
             trainer.save_checkpoint(epoch, epoch_path)
-        
+
+        # Validation (NEW)
+        if (epoch + 1) % config['val_interval'] == 0:
+            val_psnr, val_ssim = trainer.validate(val_loader)
+            print(f"\n📊 Validation Results:")
+            print(f"  PSNR: {val_psnr:.2f} dB, SSIM: {val_ssim:.3f}")
+
+            # Update best models based on validation
+            if val_psnr > trainer.best_psnr:
+                trainer.best_psnr = val_psnr
+                trainer.best_ssim = val_ssim
+                best_path = os.path.join(config['checkpoint_dir'], 'best_model.pth')
+                trainer.save_checkpoint(epoch, best_path)
+                print(f"  ✓ New best model saved! (PSNR: {val_psnr:.2f} dB)")
+
+        # LR Scheduler step (NEW)
+        if trainer.scheduler_G is not None:
+            trainer.scheduler_G.step()
+            trainer.scheduler_D.step()
+            current_lr_g = trainer.scheduler_G.get_last_lr()[0]
+            current_lr_d = trainer.scheduler_D.get_last_lr()[0]
+            print(f"  LR updated - G: {current_lr_g:.6f}, D: {current_lr_d:.6f}")
+
         # Clean
         torch.cuda.empty_cache()
         gc.collect()

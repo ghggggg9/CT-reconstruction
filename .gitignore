@@ -5,6 +5,8 @@
 # Large checkpoint and output directories
 checkpoints_transformer/
 outputs_transformer/
+checkpoints_transformer_10.6/
+outputs_transforme_10.6/
 
 # Original dataset directories (too large)
 LIDC-IDRI/
